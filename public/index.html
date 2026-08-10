@@ -812,14 +812,23 @@ const ASHARE_PREFIX=/^(60|68|00|30)/;
 // 公共 CORS 代理（浏览器侧执行，绕过东方财富 clist 无 CORS 头的问题；clist 也不支持 cb）
 // 并行竞速，谁先返回有效数据就用谁；浏览器真实网络通常可达其中之一。
 // 按历史可靠性排序：allorigins / codetabs 最稳，cors.eu.org 备用，其余兜底。
+// 8 个公共 CORS 代理（对象数组，带 name 便于健康度统计）；并行竞速，谁先返回有效数据就用谁。
+// 新增 ryanchristian / cors.bridged 两个较稳定节点；allorigins/codetabs 历史最稳排前。
 const CORS_PROXIES=[
-  u=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u),
-  u=>'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u),
-  u=>'https://cors.eu.org/?url='+encodeURIComponent(u),
-  u=>'https://corsproxy.io/?url='+encodeURIComponent(u),
-  u=>'https://proxy.cors.sh/'+encodeURIComponent(u),
-  u=>'https://thingproxy.freeboard.io/fetch/'+encodeURIComponent(u)
+  {name:'allorigins',   mk:u=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u)},
+  {name:'codetabs',     mk:u=>'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u)},
+  {name:'cors.eu.org',  mk:u=>'https://cors.eu.org/?url='+encodeURIComponent(u)},
+  {name:'corsproxy.io', mk:u=>'https://corsproxy.io/?url='+encodeURIComponent(u)},
+  {name:'cors.sh',      mk:u=>'https://proxy.cors.sh/'+encodeURIComponent(u)},
+  {name:'thingproxy',   mk:u=>'https://thingproxy.freeboard.io/fetch/'+encodeURIComponent(u)},
+  {name:'ryanchristian',mk:u=>'https://api.ryanchristian.dev/?url='+encodeURIComponent(u)},
+  {name:'cors.bridged', mk:u=>'https://cors.bridged.cc/?url='+encodeURIComponent(u)}
 ];
+// 代理健康度（成功 +1 / 失败 -1），按得分排序优先并发更稳的，减少撞到挂掉的代理
+const _proxyScore={};
+function proxyRanked(){ return [...CORS_PROXIES].sort((a,b)=>(_proxyScore[b.name]||0)-(_proxyScore[a.name]||0)); }
+function recordProxy(name, ok){ _proxyScore[name]=(_proxyScore[name]||0)+(ok?1:-1); }
+function bestProxyName(){ const r=proxyRanked(); return r.length?r[0].name:'—'; }
 // 带超时的 JSON 拉取（失败返回 null，绝不抛错中断流程）
 async function fetchJSON(u, timeout=8000){
   const ctrl=new AbortController(); const id=setTimeout(()=>ctrl.abort(), timeout);
@@ -837,7 +846,11 @@ async function emFetch(emPath, params){
   const attempts=[
     ()=>fetchJSON('/api/em?'+new URLSearchParams(Object.assign({path:emPath}, params)).toString(), 6000),
     ()=>jsonp(url).catch(()=>null),
-    ...CORS_PROXIES.map(mk=>(()=>fetchJSON(mk(url))))
+    ...proxyRanked().map(p=>(async()=>{
+      const j=await fetchJSON(p.mk(url));
+      recordProxy(p.name, !!(j&&j.data));   // 记录健康度，下次优先用稳定的
+      return j;
+    }))
   ];
   try{
     return await Promise.any(attempts.map(async fn=>{
@@ -847,7 +860,7 @@ async function emFetch(emPath, params){
 }
 // 分页拉全市场 A 股涨跌幅（clist 不支持 cb，必须走代理/CORS）
 async function fetchMarket(fs){
-  const out=[]; const pz=5000;
+  const out=[]; const pz=1000;
   for(let pn=1, guard=0; guard<20; guard++, pn++){
     let r; try{ r=await emFetch('/api/qt/clist/get', {pn, pz, po:1, np:1, fltt:2, invt:2, fid:'f3', fs, fields:'f12,f3'}); }catch(e){ break; }
     const diff=(r&&r.data&&r.data.diff)||[];
@@ -857,25 +870,61 @@ async function fetchMarket(fs){
   }
   return out;
 }
-// 涨跌家数缓存：全市场广度不会每秒剧变，缓存 30s 可大幅减少对外请求、提升稳定性
-let _udCache={t:0,data:null};
+// 东方财富「市场广度」接口：直接返回沪深北三市上涨/下跌/平盘家数（JSONP 可用，无需 CORS 代理）
+// secids: 1.000001 上证, 0.399106 深证综指, 0.899050 北证50
+// fields: f104=上涨家数, f105=下跌家数, f106=平盘家数, f6=成交额, f3=指数涨跌幅
+async function fetchMarketBreadth(){
+  const url='https://push2.eastmoney.com/webguest/api/qt/ulist.np/get?timil=1&np=1&fltt=2&invt=2&ut=fa5fd1943c7b386f172d6893dbfba10b&dect=1&intv=2&secids=1.000001,0.399106,0.899050&fields=f3,f14,f104,f105,f106,f6';
+  const r=await jsonp(url).catch(()=>null);
+  const diff=(r&&r.data&&r.data.diff)||[];
+  if(!diff.length) return null;
+  let up=0,down=0,flat=0,amount=0;
+  diff.forEach(d=>{
+    up += (+d.f104||0);
+    down += (+d.f105||0);
+    flat += (+d.f106||0);
+    amount += (+d.f6||0);
+  });
+  return {up,down,flat,amount,via:'东财-市场广度'};
+}
+// 东方财富涨跌停池：返回今日涨停/跌停股票数量
+function yyyymmdd(d=new Date()){ const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}`; }
+async function fetchLimitPool(type='up'){
+  const base='https://push2ex.eastmoney.com/getTopic'+(type==='up'?'ZT':'DT')+'Pool';
+  const url=`${base}?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&Pageindex=0&pagesize=1&sort=${type==='up'?'fbt:asc':'fund:asc'}&date=${yyyymmdd()}&_=${Date.now()}`;
+  const r=await jsonp(url).catch(()=>null);
+  // 接口返回 {data:{pool:[...]}}，数量即 pool 长度；若为空则返回 0
+  const pool=(r&&r.data&&r.data.pool)||[];
+  return Array.isArray(pool)?pool.length:0;
+}
+// 涨跌家数缓存：全市场广度不会每秒剧变，缓存 60s 大幅减少对外请求、提升稳定性（避免每 15s 都撞代理）
+let _udCache={t:0,data:null,via:'—'};
 async function getUpDown(){
   const now=Date.now();
-  if(_udCache.data && now-_udCache.t<30000) return _udCache.data;
+  if(_udCache.data && now-_udCache.t<60000) return Object.assign({}, _udCache.data, {cached:true});
+  // 1) 优先使用东财市场广度接口（直接 JSONP，最稳）
   try{
-    // 明确的 A 股板块组合（沪主板 t:6 + 科创 t:80，深主板 t:2 + 创业 t:23）
+    const bd=await fetchMarketBreadth();
+    if(bd && bd.up+bd.down+bd.flat>=3000){
+      const [limitUp,limitDown]=await Promise.all([fetchLimitPool('up'),fetchLimitPool('down')]).catch(()=>[0,0]);
+      const r={up:bd.up, down:bd.down, flat:bd.flat, limitUp, limitDown, ts:now, via:bd.via};
+      _udCache={t:now,data:r,via:bd.via}; return r;
+    }
+  }catch(e){ console.warn('[updown] 市场广度接口异常', e); }
+  // 2) 兜底：原 clist 全市场统计（需 CORS 代理，静态版下大概率失败）
+  try{
     const all=await fetchMarket('m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23');
-    // 护栏：沪深 A 股常态约 4700~5500 只；远小于此（接口真失败）走兜底
     if(all.length>=800){
       let up=0,down=0,flat=0,lu=0,ld=0;
       all.forEach(p=>{ if(p>0)up++; else if(p<0)down++; else flat++;
         if((p>=9.9&&p<11)||p>=19.9)lu++; else if((p<=-9.9&&p>-11)||p<=-19.9)ld++; });   // 涨停/跌停近似（10% 主板 / 20% 创业板·科创板）
-      const r={up,down,flat,limitUp:lu,limitDown:ld};
-      _udCache={t:now,data:r}; return r;
+      const via=bestProxyName();
+      const r={up,down,flat,limitUp:lu,limitDown:ld,ts:now,via};
+      _udCache={t:now,data:r,via}; return r;
     }
-    console.warn('[updown] 拉取数量不足，走兜底', all.length);
-  }catch(e){ console.warn('[updown] 异常', e); }
-  return {up:0,down:0,flat:0,limitUp:0,limitDown:0,demo:true};
+    console.warn('[updown] clist 拉取数量不足，走兜底', all.length);
+  }catch(e){ console.warn('[updown] clist 兜底异常', e); }
+  return {up:0,down:0,flat:0,limitUp:0,limitDown:0,demo:true,ts:now,via:'—'};
 }
 async function getSectors(){
   try{ const r=await emFetch('/api/qt/clist/get', {pn:1,pz:10,po:1,np:1,fltt:2,invt:2,fid:'f3',fs:'m:90+t:2',fields:'f12,f14,f2,f3,f62'}); if(r&&r.data&&r.data.diff) return r.data.diff; }catch(e){}
@@ -1193,8 +1242,18 @@ function renderSectors(list){ renderSectorList($('#sectorList'), list); }
 function renderHotUpdown(ud){
   const box=$('#hotUpdown');
   if(!ud){ box.innerHTML='<div class="loading">数据加载中…</div>'; return; }
+  // 数据来源 / 延迟角标：让用户在静态版（浏览器兜底）下也能看清当前是实时还是缓存
+  let meta;
+  if(ud.demo){ meta='⚠ 数据源暂不可用（保留上次数据）'; }
+  else {
+    const age = ud.ts ? Math.round((Date.now()-ud.ts)/1000) : 0;
+    const src = (location.hostname==='localhost'||location.hostname==='127.0.0.1')
+      ? '服务端代理' : '浏览器兜底';
+    meta = `来源：${src} · ${ud.via} · ${ud.cached?'缓存 '+age+'s':'实时'}`;
+  }
   const rows=[['上涨家数',ud.up,'up'],['下跌家数',ud.down,'down'],['平盘',ud.flat,'flat'],['涨停',ud.limitUp,'up'],['跌停',ud.limitDown,'down']];
-  box.innerHTML=rows.map(([k,v,cl])=>`<div class="mover-row"><span>${k}</span><span class="${cl}">${v!=null?v:'—'}</span></div>`).join('');
+  box.innerHTML=`<div class="ud-meta" style="font-size:11px;color:var(--muted);margin-bottom:6px;letter-spacing:.3px">${meta}</div>`+
+    rows.map(([k,v,cl])=>`<div class="mover-row"><span>${k}</span><span class="${cl}">${v!=null?v:'—'}</span></div>`).join('');
 }
 
 /* ===================== 主循环 ===================== */
