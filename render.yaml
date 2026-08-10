@@ -1,0 +1,17 @@
+# Render 部署配置（免费版 Web Service）
+# 用法：把本仓库推到 GitHub/GitLab，在 Render 后台 "New" → "Blueprint" 选择该仓库，
+#       或 "Deploy an existing repository" 手动指定。
+# 本工作台纯用东方财富免费接口，无需任何 token；server.js 同时提供静态托管与
+# /api/em 东方财富代理（让「涨跌家数 / 涨停跌停」稳定可用）。
+services:
+  - type: web
+    name: stock-dashboard
+    runtime: node
+    plan: free
+    branch: main
+    buildCommand: "npm install"      # 本仓库零依赖，安装会瞬间跳过
+    startCommand: "npm start"
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
