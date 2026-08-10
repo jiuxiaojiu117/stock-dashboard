@@ -1,0 +1,27 @@
+# 依赖（本项目零依赖，留空目录也忽略）
+node_modules/
+
+# 密钥：切勿提交 .env（含 iFinD token）
+.env
+.env.*
+!.env.example
+
+# 本地日志
+ifind-debug.log
+*.log
+
+# 本地静态部署快照（CloudStudio 用，非 Render 所需）
+deploy/
+dist/
+
+# 本机运行版打包产物
+release/
+*.zip
+
+# 运行态文件
+server.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
