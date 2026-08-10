@@ -835,7 +835,7 @@ async function emFetch(emPath, params){
   const q=new URLSearchParams(params).toString();
   const url='https://push2.eastmoney.com'+emPath+'?'+q;
   const attempts=[
-    ()=>fetchJSON('/api/em?'+new URLSearchParams(Object.assign({path:emPath}, params)).toString(), 3000),
+    ()=>fetchJSON('/api/em?'+new URLSearchParams(Object.assign({path:emPath}, params)).toString(), 6000),
     ()=>jsonp(url).catch(()=>null),
     ...CORS_PROXIES.map(mk=>(()=>fetchJSON(mk(url))))
   ];
