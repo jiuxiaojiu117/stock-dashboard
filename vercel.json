@@ -1,6 +1,5 @@
 {
   "version": 2,
-  "buildCommand": "cp stock-dashboard.html index.html",
   "functions": {
     "api/em.js": { "maxDuration": 15 }
   }
